@@ -1,0 +1,1172 @@
+================================================================================
+MIGRATION PROMPT v2: APScheduler → Django-Q (In-Process) + Full IST Enforcement
+================================================================================
+
+PROJECT: django_hc_v2_updated (healthcheck app)
+GOAL   : Replace APScheduler with Django-Q running INSIDE the Django process.
+         All datetime values (DB writes, UI display, admin panel, CMD logs)
+         must show and store IST (Asia/Kolkata, UTC+5:30) — no UTC anywhere
+         visible to the user or stored in the MySQL tables.
+async method Django q should work.
+
+================================================================================
+RULE #0 — IST EVERYWHERE (READ THIS FIRST)
+================================================================================
+
+The MySQL server clock runs in UTC. We will override this at the connection
+level so every NOW() call inside MySQL returns IST, and every datetime Python
+writes to DB is a plain naive IST datetime.
+
+THE SINGLE RULE:
+  - Every datetime stored in MySQL = naive IST datetime (no tzinfo).
+  - Every datetime read from MySQL = already IST, display as-is.
+  - Never store UTC in any HC table column.
+  - USE_TZ = False in settings (disables Django's UTC-aware datetimes).
+  - TIME_ZONE = "Asia/Kolkata" in settings.
+  - MySQL connection init_command forces: SET time_zone = '+05:30'
+    so MySQL's NOW() / NOW(3) returns IST automatically.
+
+CONSEQUENCE:
+  - `datetime.now()` in Python → IST (because TIME_ZONE = Asia/Kolkata,
+    USE_TZ = False means Django uses local time = IST if OS is IST, BUT
+    to be safe always use `now_ist()` from ist_utils.py instead of
+    `datetime.now()` or `datetime.utcnow()` anywhere in scheduler code).
+  - `NOW()` in raw MySQL queries → IST (because of SET time_zone = '+05:30').
+  - DB fields like last_run_at, next_run_at, scheduled_fire_at,
+    actual_start_at, completed_at, logged_at, scheduled_at → all IST.
+  - Admin panel shows DateTimeField values → IST (no conversion needed).
+  - UI templates that call utc_to_ist() → REMOVE those conversions,
+    display the value directly as it comes from DB (it is already IST).
+
+================================================================================
+RULE #1 — DJANGO-Q RUNS INSIDE THE APP (NO SEPARATE PROCESS)
+================================================================================
+
+Django-Q normally requires a separate `python manage.py qcluster` process.
+We do NOT want that. We want Django-Q's task queue to run inside the Django
+app process itself, triggered by APScheduler's replacement logic in AppConfig.
+
+HOW TO ACHIEVE THIS:
+  Use Django-Q in SYNC mode for the broker + run a lightweight in-process
+  thread that acts as the cluster. Specifically:
+
+  Option: Use `django_q.tasks.async_task` with `sync=True` in Q_CLUSTER,
+  which makes every async_task() call execute immediately in the same thread.
+  This is the simplest approach — no worker process, no Redis, no ORM broker
+  overhead. Tasks run synchronously in a background thread we manage.
+
+  IMPLEMENTATION PATTERN:
+  - Q_CLUSTER sync=True means async_task() runs the function immediately
+    in the calling thread (no queue, no worker).
+  - Schedule checking (tick every minute) is done by a single daemon thread
+    started in AppConfig.ready() — exactly like APScheduler's background
+    thread but without the APScheduler library.
+  - Manual triggers (run_now, rerun) spawn a daemon thread directly
+    (same as before) since sync=True means async_task would block the
+    request thread.
+
+  SO THE FINAL ARCHITECTURE IS:
+    - One background daemon thread (started in AppConfig.ready()) that
+      wakes every 60 seconds, checks schedules due to fire, and launches
+      them in sub-threads.
+    - async_task() used only for task registration pattern (or replaced
+      with direct threading for manual runs).
+    - django_q installed but used primarily for its Schedule model and
+      ORM-based task tracking — NOT for its cluster worker process.
+
+  SIMPLER ALTERNATIVE (RECOMMENDED):
+  Since we want in-process and no external worker, do the following:
+    1. Install django-q2 (for its models, admin, tracking).
+    2. Set Q_CLUSTER sync=True so no worker needed.
+    3. Replace APScheduler's BackgroundScheduler with a plain Python
+       threading.Timer loop (60-second tick) started in AppConfig.ready().
+    4. Use django_q.tasks.async_task() for fire-and-forget task calls
+       (they will run in-thread synchronously due to sync=True).
+    5. This means: zero external processes, zero Redis, zero ORM polling.
+
+================================================================================
+RULE #2 — SCHEDULED RUN FIRES AT EXACT start_at TIME (ZERO DELAY)
+================================================================================
+
+CURRENT PROBLEM with APScheduler:
+  APScheduler registers a CronTrigger and fires the job at the next cron tick.
+  If start_at = 04:43 PM IST and cron = "43 16 * * *", it fires at 04:43 PM.
+  But if the scheduler starts at 04:44 PM, that tick is missed.
+
+REQUIRED BEHAVIOUR:
+  - When the tick loop wakes up each minute, it checks every active schedule.
+  - For each schedule, it fires if ALL of these are true:
+      a. is_active = 1 AND customer is_active = 1
+      b. start_at has been reached (now_ist >= start_at_ist)
+      c. The current minute matches the cron expression (croniter says it's due)
+      d. last_run_at is None OR last_run_at < this cron tick's due time
+         (prevents double-fire within the same minute)
+
+  - ZERO DELAY: The tick loop sleeps for exactly (60 - current_seconds) so it
+    wakes at the top of each minute (e.g., 04:43:00). Do NOT use time.sleep(60)
+    blindly — it drifts. Use this pattern:
+
+      import time
+      from datetime import datetime
+      while running:
+          now = datetime.now()  # IST (USE_TZ=False, TIME_ZONE=Asia/Kolkata)
+          sleep_secs = 60 - now.second - now.microsecond / 1_000_000
+          time.sleep(max(sleep_secs, 0))
+          _do_tick()
+
+  - This ensures the tick fires at :00 of each minute, matching cron exactly.
+
+================================================================================
+FILES TO CHANGE — COMPLETE INSTRUCTIONS
+================================================================================
+
+------------------------------------------------------------------------
+FILE 1: django_hc/settings.py
+------------------------------------------------------------------------
+
+CHANGE 1: TIME_ZONE and USE_TZ
+  Replace:
+    TIME_ZONE = "UTC"
+    USE_TZ    = True
+  With:
+    TIME_ZONE = "Asia/Kolkata"
+    USE_TZ    = False
+
+CHANGE 2: MySQL init_command — add time_zone
+  In the "healthcheck_db" DATABASES entry, change:
+    "init_command": "SET sql_mode='STRICT_TRANS_TABLES'"
+  To:
+    "init_command": "SET sql_mode='STRICT_TRANS_TABLES', time_zone='+05:30'"
+
+  Also add the same to the "default" SQLite database if it has init_command.
+  (SQLite doesn't use time_zone but the MySQL one is what matters.)
+
+CHANGE 3: Add django_q to INSTALLED_APPS
+  INSTALLED_APPS = [
+      "django.contrib.admin",
+      "django.contrib.auth",
+      "django.contrib.contenttypes",
+      "django.contrib.sessions",
+      "django.contrib.messages",
+      "django.contrib.staticfiles",
+      "django_q",          # ← ADD THIS
+      "healthcheck",
+  ]
+
+CHANGE 4: Add Q_CLUSTER config (sync mode — no external worker needed)
+  Add this block after INSTALLED_APPS:
+
+    Q_CLUSTER = {
+        "name":        "healthcheck",
+        "sync":        True,    # run tasks in-process, no worker needed
+        "timeout":     600,     # 10 min per task
+        "catch_up":    False,   # don't re-fire missed ticks
+        "orm":         "default",
+        "label":       "HC Scheduler",
+    }
+
+CHANGE 5: Update LOGGING to include django_q logger
+  Add to "loggers":
+    "django_q": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+
+------------------------------------------------------------------------
+FILE 2: requirements.txt
+------------------------------------------------------------------------
+
+  REMOVE: apscheduler>=3.10.0
+  ADD:    django-q2>=1.6.0
+
+  Final requirements.txt:
+    Django>=4.2,<5.0
+    pymysql>=1.1.0
+    cryptography>=41.0.0
+    croniter>=1.4.0
+    django-q2>=1.6.0
+    oracledb>=1.4.0
+    openpyxl>=3.1.0
+    xlsxwriter>=3.1.0
+    python-dateutil>=2.8.2
+
+------------------------------------------------------------------------
+FILE 3: healthcheck/ist_utils.py  — UPDATE for IST-native mode
+------------------------------------------------------------------------
+
+Since we are now storing IST directly in DB (not UTC), the conversion
+functions need to change. But KEEP THE SAME FUNCTION NAMES so callers
+don't break. Just change what they do internally.
+
+Replace the entire file with:
+
+"""
+healthcheck/ist_utils.py
+========================
+IST-native mode: DB stores IST datetimes directly.
+MySQL connection is set to time_zone='+05:30' so NOW() returns IST.
+TIME_ZONE='Asia/Kolkata', USE_TZ=False in Django settings.
+
+All functions preserve their original signatures for backward compatibility.
+"""
+from datetime import datetime, timedelta, timezone as _tz
+
+IST_OFFSET  = timedelta(hours=5, minutes=30)
+IST_TZ_NAME = "Asia/Kolkata"
+
+FMT_12H  = "%d-%b-%Y %I:%M %p"     # 27-Apr-2026 04:43 PM
+FMT_12HS = "%d-%b-%Y %I:%M:%S %p"  # 27-Apr-2026 04:43:21 PM
+FMT_DB   = "%Y-%m-%d %H:%M:%S"     # MySQL format
+
+
+def now_ist() -> datetime:
+    """Return current IST time as naive datetime."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(IST_TZ_NAME)).replace(tzinfo=None)
+    except Exception:
+        return datetime.utcnow() + IST_OFFSET
+
+
+def now_utc() -> datetime:
+    """DEPRECATED in IST-native mode. Returns now_ist() for compatibility."""
+    return now_ist()
+
+
+def ist_to_utc(dt: datetime) -> datetime:
+    """
+    DEPRECATED in IST-native mode.
+    Since DB stores IST, this now returns dt unchanged.
+    Kept for backward compatibility — callers storing to DB get IST directly.
+    """
+    if dt is None:
+        return None
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt  # already IST naive — store as-is
+
+
+def utc_to_ist(dt: datetime) -> datetime:
+    """
+    DEPRECATED in IST-native mode.
+    Since DB already stores IST, no conversion needed. Returns dt unchanged.
+    Kept for backward compatibility — all callers remain unmodified.
+    """
+    if dt is None:
+        return None
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt  # already IST naive
+
+
+def fmt_ist(dt: datetime, fmt: str = FMT_12H) -> str:
+    """Format a DB datetime (already IST) as IST 12-hour string."""
+    if dt is None:
+        return "—"
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt.strftime(fmt)
+
+
+def fmt_ist_short(dt: datetime) -> str:
+    return fmt_ist(dt, FMT_12H)
+
+
+def next_run_from_start_at(cron_expression: str,
+                            start_at_ist: datetime) -> datetime:
+    """
+    Given start_at in IST, compute the first cron fire time.
+    Returns IST datetime (for direct DB storage in IST-native mode).
+    """
+    from croniter import croniter
+    base = start_at_ist - timedelta(seconds=1)
+    ci   = croniter(cron_expression, base)
+    nxt  = ci.get_next(datetime)
+    return nxt  # IST datetime — store directly
+
+
+def next_cron_after(cron_expression: str,
+                    last_run_ist: datetime) -> datetime:
+    """
+    Compute next cron fire after last_run (IST).
+    Returns IST datetime for direct DB storage.
+    """
+    from croniter import croniter
+    ci  = croniter(cron_expression, last_run_ist)
+    nxt = ci.get_next(datetime)
+    return nxt  # IST datetime
+
+
+------------------------------------------------------------------------
+FILE 4: healthcheck/scheduler_service.py — FULL REWRITE
+------------------------------------------------------------------------
+async method Django q should work.apply the method 
+Replace the entire file. This is the core replacement of APScheduler.
+Key points:
+  - No APScheduler imports anywhere.
+  - A single background daemon thread does the 60-second tick loop.
+  - All datetime values use now_ist() — stored as IST in DB.
+  - _fire_schedule, _execute_run, tracker writes — all use IST.
+  - Manual runs (run_now_sync, run_customer_now) use daemon threads.
+  - scheduler_status() reads from DB tracker table (IST values, display directly).
+
+Write the complete file as follows:
+
+"""
+healthcheck/scheduler_service.py  (Django-Q migration — IST-native)
+====================================================================
+Replaces APScheduler with:
+  - A plain Python daemon thread that ticks every minute (aligned to :00).
+  - croniter checks which schedules are due each tick.
+  - All datetimes are IST (MySQL connection forced to +05:30, USE_TZ=False).
+  - Django-Q installed but sync=True — tasks run in-process.
+  - No external qcluster process needed.
+"""
+import logging
+import threading
+import time
+import traceback
+from datetime import datetime, timedelta
+from typing import Optional
+
+from healthcheck.ist_utils import (
+    now_ist, utc_to_ist, ist_to_utc, fmt_ist,
+    next_cron_after, next_run_from_start_at,
+)
+
+logger = logging.getLogger("hc.scheduler")
+
+# ── Global state ─────────────────────────────────────────────────────────────
+_scheduler_thread: Optional[threading.Thread] = None
+_scheduler_running = False
+_scheduler_lock    = threading.Lock()
+_active_runs: dict = {}
+_active_runs_lock  = threading.Lock()
+
+
+# ── Engine bridge ─────────────────────────────────────────────────────────────
+def _get_engine():
+    from healthcheck.engine_bridge import get_engine
+    return get_engine()
+
+
+# ── DB error types ─────────────────────────────────────────────────────────────
+def _db_err():
+    types = (ConnectionError,)
+    try:
+        from healthcheck.engine.core.db_manager import DBConnectionError
+        types += (DBConnectionError,)
+    except ImportError:
+        pass
+    try:
+        import pymysql.err as pe
+        types += (pe.OperationalError, pe.InterfaceError)
+    except ImportError:
+        pass
+    return types
+
+
+# ── Tracker helpers ───────────────────────────────────────────────────────────
+def _update_tracker(db, tracker_id: int, **kwargs):
+    """Update scheduler_tracker row. All datetime values passed must be IST."""
+    try:
+        if not kwargs or not tracker_id:
+            return
+        sets = ", ".join(f"{k}=%s" for k in kwargs)
+        vals = list(kwargs.values()) + [tracker_id]
+        db.execute(
+            f"UPDATE scheduler_tracker SET {sets}, updated_at=NOW() WHERE id=%s",
+            vals)
+    except Exception as e:
+        logger.warning(f"tracker update: {e}")
+
+
+def _create_tracker(db, schedule_id, customer_id, env_types,
+                    schedule_name, cron_expr, fire_at_ist,
+                    triggered_by="django_q") -> int:
+    """
+    Insert a scheduler_tracker row.
+    fire_at_ist: IST datetime — stored directly (DB is IST-native).
+    triggered_by changed from 'apscheduler' to 'django_q'.
+    """
+    try:
+        return db.insert_get_id(
+            """INSERT INTO scheduler_tracker
+               (schedule_id,customer_id,env_types,schedule_name,cron_expression,
+                status,scheduled_fire_at,triggered_by,is_active,created_at,updated_at)
+               VALUES(%s,%s,%s,%s,%s,'PENDING',%s,%s,1,NOW(),NOW())""",
+            (schedule_id, customer_id, env_types, schedule_name,
+             cron_expr, fire_at_ist, triggered_by))
+    except Exception as e:
+        logger.warning(f"tracker insert: {e}")
+        return 0
+
+
+# ── Status helper ─────────────────────────────────────────────────────────────
+def _get_status(run_id: int) -> str:
+    try:
+        eng = _get_engine()
+        with eng["DBManager"]() as db:
+            row = db.fetch_one(
+                "SELECT status FROM execution_runs WHERE id=%s", (run_id,))
+            return row["status"] if row else "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+
+
+# ── Execute run (runs in a daemon thread) ─────────────────────────────────────
+def _execute_run(run_id: int, label: str, tracker_id: int = 0):
+    """
+    Execute a health check run. Called in a daemon thread.
+    All datetimes written to DB via tracker use now_ist() → IST stored directly.
+    """
+    _coinit = False
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        _coinit = True
+    except Exception:
+        pass
+
+    eng = _get_engine()
+    with _active_runs_lock:
+        _active_runs[run_id] = label
+
+    try:
+        with eng["DBManager"]() as db:
+            eng["ConfigLoader"].load(db)
+            if tracker_id:
+                _update_tracker(db, tracker_id,
+                                run_id=run_id,
+                                status="RUNNING",
+                                actual_start_at=now_ist())   # IST
+            eng["RunLauncher"](db, run_id, eng["ConfigLoader"].get()).launch()
+
+        final = _get_status(run_id)
+        logger.info(f"[Scheduler] Run #{run_id} ({label}) → {final}")
+
+        if tracker_id:
+            with eng["DBManager"]() as db:
+                st = "COMPLETED" if final in ("COMPLETED", "PARTIAL") else "FAILED"
+                _update_tracker(db, tracker_id,
+                                status=st,
+                                completed_at=now_ist(),      # IST
+                                error_message=None if st == "COMPLETED" else final)
+    except Exception as exc:
+        logger.error(f"[Scheduler] Run #{run_id} error: {exc}", exc_info=True)
+        if tracker_id:
+            try:
+                with eng["DBManager"]() as db:
+                    _update_tracker(db, tracker_id,
+                                    status="FAILED",
+                                    completed_at=now_ist(),  # IST
+                                    error_message=str(exc)[:1000])
+            except Exception:
+                pass
+    finally:
+        with _active_runs_lock:
+            _active_runs.pop(run_id, None)
+        if _coinit:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+# ── Fire a single schedule ─────────────────────────────────────────────────────
+def _fire_schedule(sched: dict):
+    """
+    Fire one schedule row. All DB writes use IST datetimes.
+    sched: dict from DB — start_at, last_run_at, next_run_at are IST values
+           (because MySQL connection is set to +05:30).
+    """
+    eng           = _get_engine()
+    now           = now_ist()
+    schedule_id   = sched["id"]
+    customer_id   = sched["customer_id"]
+    env_types     = sched["env_types"]
+    schedule_name = sched["schedule_name"]
+    customer_name = sched["customer_name"]
+    cron_expr     = sched["cron_expression"]
+    add hrs , weekly , mimits alsooprinal
+    label         = f"{customer_name}/{env_types}"
+
+    # start_at gate: must have reached start_at before firing
+    start_at = sched.get("start_at")
+    if start_at is not None:
+        # start_at from DB is already IST (MySQL is +05:30)
+        if hasattr(start_at, 'tzinfo') and start_at.tzinfo is not None:
+            start_at = start_at.replace(tzinfo=None)
+        if now < start_at:
+            logger.info(
+                f"[Scheduler] '{schedule_name}' — start_at="
+                f"{start_at.strftime('%d-%b-%Y %I:%M %p IST')} not reached yet "
+                f"(now={now.strftime('%I:%M %p IST')}). Skipping.")
+            return
+
+    logger.info(
+        f"[Scheduler] Firing '{schedule_name}' | {label} | "
+        f"IST={now.strftime('%d-%b-%Y %I:%M:%S %p')}")
+
+    tracker_id = 0
+    try:
+        with eng["DBManager"]() as db:
+            eng["ConfigLoader"].load(db)
+
+            # Next cron tick (IST → IST, since ist_utils now returns IST directly)
+            next_ist = next_cron_after(cron_expr, now)
+
+            tracker_id = _create_tracker(
+                db, schedule_id, customer_id, env_types,
+                schedule_name, cron_expr,
+                fire_at_ist=now)  # IST stored directly
+
+            run_id = db.insert_get_id(
+                """INSERT INTO execution_runs
+                   (schedule_id,customer_id,env_types,
+                    run_type,status,triggered_by)
+                   VALUES(%s,%s,%s,'SCHEDULED','PENDING','django_q')""",
+                (schedule_id, customer_id, env_types))
+
+            # Store IST in DB — MySQL connection is +05:30 so NOW() is IST too
+            # But for explicit Python-written values, we pass IST datetime directly
+            db.execute(
+                "UPDATE schedules SET last_run_at=%s, next_run_at=%s WHERE id=%s",
+                (now, next_ist, schedule_id))   # now=IST, next_ist=IST
+
+            if tracker_id:
+                _update_tracker(db, tracker_id,
+                                run_id=run_id,
+                                last_run_at=now,       # IST
+                                next_run_at=next_ist)  # IST
+
+        logger.info(
+            f"[Scheduler] Run #{run_id} | "
+            f"last={now.strftime('%d-%b-%Y %I:%M %p IST')} | "
+            f"next={next_ist.strftime('%d-%b-%Y %I:%M %p IST')}")
+
+        # Launch in daemon thread so tick loop is not blocked
+        t = threading.Thread(
+            target=_execute_run,
+            args=(run_id, label, tracker_id),
+            daemon=True,
+            name=f"hc_run_{run_id}")
+        t.start()
+
+    except Exception as exc:
+        if isinstance(exc, _db_err()):
+            logger.error(
+                f"[Scheduler] DB down for '{schedule_name}'. Retry next tick. {exc}")
+            return
+        logger.error(
+            f"[Scheduler] Error firing '{schedule_name}': {exc}", exc_info=True)
+        if tracker_id:
+            try:
+                with eng["DBManager"]() as db:
+                    _update_tracker(db, tracker_id,
+                                    status="FAILED",
+                                    error_message=str(exc)[:1000])
+            except Exception:
+                pass
+
+start at timing is first run execution 
+# ── Load schedules from DB ────────────────────────────────────────────────────
+def _load_schedules() -> list:
+    try:
+        eng = _get_engine()
+        with eng["DBManager"]() as db:
+            return db.fetch_all(
+                """SELECT s.id, s.customer_id, s.env_types, s.cron_expression,
+                          s.schedule_name, s.start_at, s.last_run_at, s.next_run_at,
+                          c.name AS customer_name
+                   FROM schedules s
+                   JOIN customers c ON c.id=s.customer_id
+                   WHERE s.is_active=1 AND c.is_active=1""")
+    except Exception as exc:
+        logger.error(f"Cannot load schedules: {exc}")
+        return []
+
+
+# ── Tick: check all schedules and fire due ones ───────────────────────────────
+def _do_tick():
+    """
+    Called every minute (aligned to :00 of each minute).
+    Checks all active schedules and fires those that are due.
+
+    Due condition:
+      1. start_at reached (or no start_at set)
+      2. Current minute matches cron expression (croniter confirms it)
+      3. Not already run this cron tick (last_run_at < current cron due time)
+    """
+    from croniter import croniter
+
+    schedules = _load_schedules()
+    now       = now_ist()
+
+    # Strip seconds so we compare at minute precision
+    now_minute = now.replace(second=0, microsecond=0)
+
+    for sched in schedules:
+        try:
+            cron_expr = sched["cron_expression"]
+            last_run  = sched.get("last_run_at")
+
+            # Compute what the current cron tick is (the minute that just fired)
+            # Use now_minute - 1 second as base so croniter returns this minute
+            ci = croniter(cron_expr, now_minute - timedelta(seconds=1))
+            due_at = ci.get_next(datetime).replace(second=0, microsecond=0)
+
+            # Is the current minute exactly the due minute?
+            if due_at != now_minute:
+                continue  # Not due this minute
+
+            # Has this tick already been fired? (last_run_at >= due_at)
+            if last_run is not None:
+                if hasattr(last_run, 'tzinfo') and last_run.tzinfo is not None:
+                    last_run = last_run.replace(tzinfo=None)
+                last_run_minute = last_run.replace(second=0, microsecond=0)
+                if last_run_minute >= due_at:
+                    continue  # Already fired for this tick
+
+            # Fire this schedule
+            _fire_schedule(sched)
+
+        except Exception as exc:
+            logger.error(
+                f"[Scheduler] Tick error for schedule id={sched.get('id')}: {exc}",
+                exc_info=True)
+
+
+# ── Stuck run recovery ────────────────────────────────────────────────────────
+def _recover_stuck_runs():
+    """
+    Detect runs stuck in IN_PROGRESS/PENDING beyond timeout.
+    Mark them FAILED, send failure email, queue rerun.
+    All datetime comparisons use IST (DB values are IST since MySQL is +05:30).
+    """
+    try:
+        eng = _get_engine()
+        with eng["DBManager"]() as db:
+            cfg = eng["ConfigLoader"].get()
+            stuck_minutes = getattr(cfg, 'stuck_run_timeout_minutes', 90)
+
+            # NOW() in MySQL returns IST (connection set to +05:30)
+            stuck = db.fetch_all(
+                """SELECT er.*, c.name AS cname
+                   FROM execution_runs er
+                   JOIN customers c ON c.id=er.customer_id
+                   WHERE er.status IN ('IN_PROGRESS','PENDING')
+                     AND er.started_at IS NOT NULL
+                     AND er.started_at < NOW() - INTERVAL %s MINUTE
+                   ORDER BY er.started_at""",
+                (stuck_minutes,))
+
+            if not stuck:
+                return
+
+            logger.info(f"[Scheduler] Found {len(stuck)} stuck run(s) to recover")
+
+            from healthcheck.engine.notifications.email_service import EmailService
+            from healthcheck.engine.core.logger import SilentLogger
+
+            for run in stuck:
+                run_id = run["id"]
+                cname  = run["cname"]
+                env    = run["env_types"]
+                logger.info(
+                    f"[Scheduler] {cname}/{env} | Run #{run_id} stuck "
+                    f"since {run['started_at']} IST — marking FAILED")
+
+                fail_reason = (
+                    f"Run #{run_id} stuck in {run['status']} for >{stuck_minutes}min. "
+                    f"Likely cause: process killed or DB lost connection mid-run.")
+
+                db.execute(
+                    """UPDATE execution_runs
+                       SET status='FAILED', completed_at=NOW(),
+                           error_summary=%s
+                       WHERE id=%s AND status IN ('IN_PROGRESS','PENDING')""",
+                    (fail_reason[:2000], run_id))
+
+                # Send failure email
+                try:
+                    email_svc = EmailService(db, SilentLogger())
+                    for et in [e.strip() for e in env.split(",")]:
+                        email_svc.send_failure(
+                            run_id=run_id,
+                            customer_id=run["customer_id"],
+                            customer_name=cname,
+                            env_type=et,
+                            error_message=fail_reason,
+                            triggered_by=run.get("triggered_by", "system"),
+                            step_failures=[{
+                                "step": "Run Recovery",
+                                "reason": fail_reason}])
+                except Exception as exc:
+                    logger.error(
+                        f"[Scheduler] Failed to send stuck-run email for #{run_id}: {exc}")
+
+                # Queue rerun
+                try:
+                    cur_att = run.get("rerun_attempt") or 0
+                    mx      = cfg.rerun_max_attempts
+                    nxt_att = cur_att + 1
+                    if nxt_att <= mx:
+                        # Schedule rerun: IST datetime stored directly
+                        sched_at = now_ist() + timedelta(hours=cfg.rerun_interval_hours)
+                        existing = db.fetch_one(
+                            "SELECT id FROM rerun_queue "
+                            "WHERE original_run_id=%s "
+                            "AND status IN ('PENDING','IN_PROGRESS')",
+                            (run_id,))
+                        if not existing:
+                            db.insert_get_id(
+                                """INSERT INTO rerun_queue
+                                   (original_run_id, customer_id, env_types,
+                                    attempt_number, max_attempts,
+                                    status, scheduled_at, last_error)
+                                   VALUES (%s,%s,%s,%s,%s,'PENDING',%s,%s)""",
+                                (run_id, run["customer_id"], env,
+                                 nxt_att, mx, sched_at, fail_reason[:2000]))
+                            logger.info(
+                                f"[Scheduler] {cname}/{env} | Queued recovery rerun "
+                                f"attempt {nxt_att}/{mx}")
+                    else:
+                        db.execute(
+                            """UPDATE rerun_queue
+                               SET status='EXHAUSTED', last_error=%s, completed_at=NOW()
+                               WHERE original_run_id=%s
+                                 AND status NOT IN ('EXHAUSTED','COMPLETED')""",
+                            (fail_reason[:500], run_id))
+                        logger.info(
+                            f"[Scheduler] {cname}/{env} | Run #{run_id} "
+                            f"exhausted all {mx} attempts (recovered)")
+                except Exception as exc:
+                    logger.error(
+                        f"[Scheduler] Failed to queue rerun for stuck run #{run_id}: {exc}")
+    except Exception as exc:
+        logger.error(f"[Scheduler] _recover_stuck_runs error: {exc}", exc_info=True)
+
+
+# ── Main scheduler thread loop ────────────────────────────────────────────────
+def _scheduler_loop():
+    """
+    Background daemon thread. Ticks every minute aligned to :00.
+    Checks schedules, fires due ones, and runs stuck-run recovery every 10 ticks.
+    """
+    global _scheduler_running
+    logger.info("[Scheduler] Thread started (Django-Q in-process mode).")
+
+    tick_count = 0
+    while _scheduler_running:
+        # Sleep until the top of the next minute (zero drift)
+        now        = now_ist()
+        sleep_secs = 60 - now.second - now.microsecond / 1_000_000
+        time.sleep(max(sleep_secs, 0.1))
+
+        if not _scheduler_running:
+            break
+
+        tick_count += 1
+        ist_now = now_ist()
+        logger.info(
+            f"[Scheduler] Tick #{tick_count} | "
+            f"{ist_now.strftime('%d-%b-%Y %I:%M:%S %p IST')}")
+
+        try:
+            _do_tick()
+        except Exception as exc:
+            logger.error(f"[Scheduler] Tick error: {exc}\n{traceback.format_exc()}")
+
+        # Stuck-run recovery every 10 minutes (every 10 ticks)
+        if tick_count % 10 == 0:
+            try:
+                _recover_stuck_runs()
+            except Exception as exc:
+                logger.error(f"[Scheduler] Stuck-run recovery error: {exc}")
+
+    logger.info("[Scheduler] Thread stopped.")
+
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
+def start_scheduler():
+    """Start the background scheduler thread. Called from AppConfig.ready()."""
+    global _scheduler_thread, _scheduler_running
+    with _scheduler_lock:
+        if _scheduler_thread and _scheduler_thread.is_alive():
+            logger.info("[Scheduler] Already running.")
+            return
+        _scheduler_running = True
+        _scheduler_thread  = threading.Thread(
+            target=_scheduler_loop,
+            daemon=True,
+            name="hc_scheduler")
+        _scheduler_thread.start()
+        logger.info("[Scheduler] Started (in-process, Django-Q sync mode).")
+
+
+def stop_scheduler():
+    global _scheduler_running
+    with _scheduler_lock:
+        _scheduler_running = False
+    logger.info("[Scheduler] Stop signal sent.")
+
+
+def restart_scheduler():
+    stop_scheduler()
+    time.sleep(2)
+    start_scheduler()
+
+
+def get_scheduler():
+    return _scheduler_thread
+
+
+# ── scheduler_status() — for UI dashboard ────────────────────────────────────
+def scheduler_status() -> dict:
+    """
+    Returns scheduler status for the dashboard/UI.
+    All datetime values come from DB as IST — display directly, no conversion.
+    """
+    now_ist_str = now_ist().strftime("%d-%b-%Y %I:%M:%S %p")
+    is_running  = bool(_scheduler_thread and _scheduler_thread.is_alive())
+
+    if not is_running:
+        return {
+            "running":          False,
+            "job_count":        0,
+            "jobs":             [],
+            "active_runs":      [],
+            "active_run_count": 0,
+            "timezone":         "Asia/Kolkata",
+            "server_time_ist":  now_ist_str,
+        }
+
+    # Load schedules to show as "jobs" in the UI
+    schedules = _load_schedules()
+    jobs = []
+    for s in schedules:
+        nxt = s.get("next_run_at")
+        # next_run_at is already IST (DB is IST-native)
+        if nxt:
+            if hasattr(nxt, 'tzinfo') and nxt.tzinfo is not None:
+                nxt = nxt.replace(tzinfo=None)
+            nxt_str = nxt.strftime("%d-%b-%Y %I:%M %p IST")
+        else:
+            nxt_str = "—"
+        jobs.append({
+            "id":       f"sched_{s['id']}",
+            "name":     s["schedule_name"],
+            "next_run": nxt_str,
+        })
+
+    with _active_runs_lock:
+        active = [{"run_id": rid, "label": lbl}
+                  for rid, lbl in _active_runs.items()]
+
+    return {
+        "running":          True,
+        "job_count":        len(jobs),
+        "jobs":             jobs,
+        "active_runs":      active,
+        "active_run_count": len(active),
+        "timezone":         "Asia/Kolkata",
+        "server_time_ist":  now_ist_str,
+    }
+
+
+# ── Manual run helpers ────────────────────────────────────────────────────────
+def run_now_sync(schedule_id: int) -> Optional[int]:
+    """Admin 'Run Now'. Spawns daemon thread. All DB writes in IST."""
+    eng = _get_engine()
+    try:
+        with eng["DBManager"]() as db:
+            eng["ConfigLoader"].load(db)
+            s = db.fetch_one(
+                "SELECT s.*, c.name AS cname FROM schedules s "
+                "JOIN customers c ON c.id=s.customer_id WHERE s.id=%s",
+                (schedule_id,))
+            if not s:
+                return None
+
+            now      = now_ist()   # IST
+            next_ist = next_cron_after(s["cron_expression"], now)  # IST
+
+            run_id = db.insert_get_id(
+                """INSERT INTO execution_runs
+                   (schedule_id,customer_id,env_types,
+                    run_type,status,triggered_by)
+                   VALUES(%s,%s,%s,'MANUAL','PENDING','admin:run_now')""",
+                (s["id"], s["customer_id"], s["env_types"]))
+
+            db.execute(
+                "UPDATE schedules SET last_run_at=%s, next_run_at=%s WHERE id=%s",
+                (now, next_ist, schedule_id))   # IST values
+
+            tracker_id = _create_tracker(
+                db, schedule_id, s["customer_id"], s["env_types"],
+                s["schedule_name"], s["cron_expression"],
+                fire_at_ist=now,
+                triggered_by="admin:run_now")
+
+        label = f"{s['cname']}/{s['env_types']}"
+        t = threading.Thread(
+            target=_execute_run,
+            args=(run_id, label, tracker_id),
+            daemon=True,
+            name=f"hc_run_{run_id}")
+        t.start()
+        return run_id
+    except Exception as exc:
+        logger.error(f"run_now_sync: {exc}", exc_info=True)
+        return None
+
+
+def run_customer_now(customer_id: int, env_types: str) -> Optional[int]:
+    """Manual run for customer+env. Spawns daemon thread."""
+    eng = _get_engine()
+    try:
+        with eng["DBManager"]() as db:
+            eng["ConfigLoader"].load(db)
+            run_id = db.insert_get_id(
+                """INSERT INTO execution_runs
+                   (customer_id,env_types,run_type,status,triggered_by)
+                   VALUES(%s,%s,'MANUAL','PENDING','admin:manual')""",
+                (customer_id, env_types))
+            cust  = db.fetch_one(
+                "SELECT name FROM customers WHERE id=%s", (customer_id,))
+            cname = cust["name"] if cust else str(customer_id)
+
+        label = f"{cname}/{env_types}"
+        t = threading.Thread(
+            target=_execute_run,
+            args=(run_id, label, 0),
+            daemon=True,
+            name=f"hc_run_{run_id}")
+        t.start()
+        return run_id
+    except Exception as exc:
+        logger.error(f"run_customer_now: {exc}", exc_info=True)
+        return None
+
+
+# ── api_scheduler_status alias ───────────────────────────────────────────────
+# views.py calls scheduler_status() — no change needed there.
+
+
+------------------------------------------------------------------------
+FILE 5: healthcheck/apps.py — Small update only
+------------------------------------------------------------------------
+
+In the ready() method, change ONLY these lines:
+
+  OLD:
+    from healthcheck.scheduler_service import start_scheduler
+    start_scheduler()
+    logger.info("Scheduler started via AppConfig.ready()")
+
+  NEW:
+    from healthcheck.scheduler_service import start_scheduler
+    start_scheduler()
+    logger.info("Django-Q in-process scheduler started via AppConfig.ready()")
+
+Everything else in apps.py stays exactly the same (RUN_MAIN guard, etc.).
+
+
+------------------------------------------------------------------------
+FILE 6: healthcheck/engine/scheduling/scheduler.py — IST fix only
+------------------------------------------------------------------------
+
+This file uses `datetime.now()` which may return server local time (UTC on
+server). Since we set USE_TZ=False and TIME_ZONE=Asia/Kolkata, `datetime.now()`
+SHOULD return IST IF the OS timezone is also Asia/Kolkata. To be safe, replace
+every `datetime.now()` call in this file with a safe IST call.
+
+At the top of the file, add:
+  from healthcheck.ist_utils import now_ist
+
+Then replace every occurrence of `datetime.now()` with `now_ist()`.
+
+Also: the `datetime.now() + timedelta(...)` expressions for rerun scheduling —
+replace with `now_ist() + timedelta(...)`.
+
+The `NOW()` SQL calls are fine — MySQL is already set to +05:30 so they return IST.
+
+
+------------------------------------------------------------------------
+FILE 7: healthcheck/engine/scheduling/run_launcher.py — IST fix only
+------------------------------------------------------------------------
+
+Same as scheduler.py:
+  1. Add: from healthcheck.ist_utils import now_ist
+  2. Replace: `datetime.now()` → `now_ist()`
+  3. The `datetime.now() + timedelta(hours=self.cfg.rerun_interval_hours)`
+     for rerun scheduling → `now_ist() + timedelta(hours=self.cfg.rerun_interval_hours)`
+  4. `NOW()` in SQL strings → leave as-is (MySQL handles it in IST).
+
+
+------------------------------------------------------------------------
+FILE 8: healthcheck/admin.py — Remove UTC conversion in display methods
+------------------------------------------------------------------------
+
+The admin currently converts DB values from UTC to IST for display.
+Since DB now stores IST directly, remove the utc_to_ist() call in
+display methods like start_at_ist(), last_run_ist(), next_run_ist().
+
+Find the ScheduleAdmin class methods like:
+
+  OLD:
+    def start_at_ist(self, obj):
+        from healthcheck.ist_utils import utc_to_ist
+        dt = obj.start_at
+        return utc_to_ist(dt).strftime("%d-%b-%Y %I:%M %p IST")
+
+  NEW (since DB is now IST-native, value is already IST):
+    def start_at_ist(self, obj):
+        dt = obj.start_at
+        if not dt:
+            return "—"
+        if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt.strftime("%d-%b-%Y %I:%M %p IST")
+
+  Apply same pattern to last_run_ist() and next_run_ist() methods.
+
+  NOTE: ist_utils.utc_to_ist() now returns dt unchanged (IST-native mode),
+  so even if you leave the call in place it is harmless — but clean it up
+  for clarity.
+
+  ALSO: The Schedule admin form for start_at field — the help_text says
+  "Enter time in IST". This is still correct. The value entered by admin
+  IS IST and is now stored directly as IST. Remove any code that was
+  converting the saved value from IST to UTC on save().
+
+  Find in ScheduleAdmin.save_model() or any signal:
+    OLD: obj.start_at = ist_to_utc(form.cleaned_data["start_at"])
+    NEW: obj.start_at = form.cleaned_data["start_at"]   # already IST, store as-is
+
+------------------------------------------------------------------------
+FILE 9: healthcheck/views.py — One change only (trigger_rerun)
+------------------------------------------------------------------------
+
+In trigger_rerun view, find:
+  threading.Thread(target=_execute_run, args=(new_id, label, tracker_id), daemon=True, ...).start()
+
+This is already a thread — no change needed for the threading part.
+But ensure the rerun scheduled_at value uses now_ist():
+
+  Find any datetime.now() + timedelta in the rerun scheduling INSERT and
+  change to now_ist() + timedelta.
+
+All other scheduler_service imports in views.py (scheduler_status,
+start_scheduler, stop_scheduler, restart_scheduler, run_now_sync,
+run_customer_now) stay exactly the same — these functions still exist.
+
+------------------------------------------------------------------------
+FILE 10: healthcheck/templatetags/ist_filters.py — Verify no conversion
+------------------------------------------------------------------------
+
+Check this file. If any filter calls utc_to_ist() to convert for display,
+it is now a no-op (utc_to_ist returns the value unchanged in IST-native mode).
+Leave the calls in place — they are now harmless pass-throughs.
+No changes required unless the filter was doing arithmetic (subtract UTC offset
+and add IST offset = double conversion) — if so, simplify to just return dt.
+
+
+================================================================================
+MIGRATION STEPS (RUN IN ORDER)
+================================================================================
+
+Step 1: Install package
+  pip install django-q2
+
+Step 2: Run migrations (creates Django-Q tables in default/SQLite DB)
+  python manage.py migrate
+
+Step 3: Verify MySQL timezone
+  In MySQL shell: SELECT NOW(), @@session.time_zone;
+  After the init_command change, this should return IST time and '+05:30'.
+  If the MySQL server itself needs tzinfo tables loaded, run:
+    mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+
+Step 4: Check existing data (one-time migration of UTC → IST in DB)
+  IMPORTANT: If your existing MySQL rows have UTC datetimes in columns like
+  last_run_at, next_run_at, start_at, scheduled_fire_at, actual_start_at,
+  completed_at, scheduled_at, logged_at — you must convert them once:
+
+    UPDATE schedules
+    SET last_run_at = CONVERT_TZ(last_run_at, '+00:00', '+05:30'),
+        next_run_at = CONVERT_TZ(next_run_at, '+00:00', '+05:30'),
+        start_at    = CONVERT_TZ(start_at,    '+00:00', '+05:30')
+    WHERE last_run_at IS NOT NULL OR next_run_at IS NOT NULL OR start_at IS NOT NULL;
+
+    UPDATE execution_runs
+    SET started_at   = CONVERT_TZ(started_at,   '+00:00', '+05:30'),
+        completed_at = CONVERT_TZ(completed_at, '+00:00', '+05:30'),
+        created_at   = CONVERT_TZ(created_at,   '+00:00', '+05:30')
+    WHERE started_at IS NOT NULL;
+
+    UPDATE scheduler_tracker
+    SET scheduled_fire_at = CONVERT_TZ(scheduled_fire_at, '+00:00', '+05:30'),
+        actual_start_at   = CONVERT_TZ(actual_start_at,   '+00:00', '+05:30'),
+        completed_at      = CONVERT_TZ(completed_at,       '+00:00', '+05:30'),
+        created_at        = CONVERT_TZ(created_at,         '+00:00', '+05:30'),
+        updated_at        = CONVERT_TZ(updated_at,         '+00:00', '+05:30')
+    WHERE scheduled_fire_at IS NOT NULL;
+
+    -- Apply similarly to rerun_queue, execution_logs, run_step_log
+
+  Run this ONE TIME before starting the app with the new code.
+
+Step 5: Start Django normally (no qcluster needed)
+  python manage.py runserver
+  OR
+  gunicorn django_hc.wsgi
+
+  The scheduler thread starts automatically via AppConfig.ready().
+  Watch the console for:
+    [Scheduler] Thread started (Django-Q in-process mode).
+    [Scheduler] Tick #1 | 27-Apr-2026 04:43:00 PM IST
+
+
+================================================================================
+WHAT IS NOT CHANGING
+================================================================================
+
+- healthcheck/engine/core/executor.py — no changes
+- healthcheck/engine/core/config.py — no changes
+- healthcheck/engine/core/db_manager.py — no changes
+- healthcheck/engine/core/logger.py — no changes
+- healthcheck/engine/notifications/email_service.py — no changes
+- healthcheck/engine/checks/ — no changes
+- healthcheck/engine/reports/ — no changes
+- healthcheck/engine_bridge.py — no changes
+- healthcheck/models.py — no changes
+- healthcheck/urls.py — no changes
+- healthcheck/middleware.py — no changes
+- healthcheck/forms.py — no changes
+- All templates — no changes
+- DB schema — no changes (columns remain DATETIME, just values change to IST)
+
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+| Concern              | Old (APScheduler + UTC)              | New (In-process + IST)                      |
+|----------------------|--------------------------------------|---------------------------------------------|
+| Scheduler engine     | APScheduler BackgroundScheduler      | Plain daemon thread + croniter              |
+| Tick timing          | CronTrigger (may drift)              | Sleep until :00 of each minute (zero drift) |
+| DB datetimes         | UTC stored, converted to IST for UI  | IST stored directly, displayed as-is        |
+| MySQL NOW()          | Returns UTC (server default)         | Returns IST (SET time_zone='+05:30')        |
+| Python datetime.now()| UTC (utcnow) or ambiguous           | now_ist() always returns IST                |
+| Admin panel          | Shows UTC, converted by display fn   | Shows IST directly (no conversion needed)   |
+| CMD/logs             | UTC timestamps                       | IST timestamps                              |
+| External process     | None (APScheduler in-process)        | None (Django-Q sync mode, in-process)       |
+| start_at behaviour   | APScheduler skips if missed          | Tick checks start_at gate every minute      |
+| Rerun scheduling     | datetime.now() + hours (UTC)         | now_ist() + hours (IST stored)              |
+| Manual runs          | threading.Thread (unchanged)         | threading.Thread (unchanged)                |
+| Triggered_by label   | 'apscheduler'                        | 'django_q'                                  |
+
+
+================================================================================
+END OF PROMPT
+================================================================================
